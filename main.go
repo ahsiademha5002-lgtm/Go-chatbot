@@ -1,178 +1,238 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
+	"net"
 	"net/rpc"
 	"os"
 	"os/signal"
-	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"awesomeProject1/shared"
 )
 
-type ClientApp struct {
-	rpcClient *rpc.Client
-	username  string
-	stopChan  chan struct{}
+type Client struct {
+	Username   string
+	Queue      chan shared.Message
+	LastActive time.Time
+}
+
+type ChatServer struct {
+	mu      sync.RWMutex
+	clients map[string]*Client
+}
+
+func NewChatServer() *ChatServer {
+	cs := &ChatServer{
+		clients: make(map[string]*Client),
+	}
+	// Background cleanup for stale polling clients (30-second timeout)
+	go cs.cleanupStaleClients(30 * time.Second)
+	return cs
+}
+
+func (s *ChatServer) Join(args *shared.JoinArgs, reply *shared.JoinReply) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if args.Username == "" {
+		reply.Success = false
+		reply.Message = "Username cannot be empty."
+		return nil
+	}
+
+	if _, exists := s.clients[args.Username]; exists {
+		reply.Success = false
+		reply.Message = fmt.Sprintf("Username '%s' is already taken.", args.Username)
+		return nil
+	}
+
+	client := &Client{
+		Username:   args.Username,
+		Queue:      make(chan shared.Message, 100),
+		LastActive: time.Now(),
+	}
+	s.clients[args.Username] = client
+
+	reply.Success = true
+	reply.Message = fmt.Sprintf("Welcome to the chat, %s!", args.Username)
+
+	// Broadcast Join Notification (excluding the newly joined user)
+	s.broadcastUnsafe(shared.Message{
+		Sender:    "SERVER",
+		Content:   fmt.Sprintf("User '%s' has joined the chat.", args.Username),
+		Type:      shared.TypeNotification,
+		Timestamp: time.Now(),
+	}, args.Username)
+
+	log.Printf("User '%s' joined.", args.Username)
+	return nil
+}
+
+func (s *ChatServer) Leave(args *shared.LeaveArgs, reply *shared.LeaveReply) error {
+	s.removeClient(args.Username)
+	reply.Success = true
+	return nil
+}
+
+func (s *ChatServer) SendMessage(args *shared.SendMessageArgs, reply *shared.SendMessageReply) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	client, exists := s.clients[args.Sender]
+	if !exists {
+		reply.Success = false
+		reply.Message = "User is not registered on the server."
+		return nil
+	}
+	client.LastActive = time.Now()
+
+	msg := shared.Message{
+		Sender:    args.Sender,
+		Content:   args.Content,
+		Type:      shared.TypeChat,
+		Timestamp: time.Now(),
+	}
+
+	// Broadcast to all other users excluding sender
+	s.broadcastUnsafe(msg, args.Sender)
+	reply.Success = true
+	return nil
+}
+
+func (s *ChatServer) FetchMessages(args *shared.FetchMessagesArgs, reply *shared.FetchMessagesReply) error {
+	s.mu.Lock()
+	client, exists := s.clients[args.Username]
+	if exists {
+		client.LastActive = time.Now()
+	}
+	s.mu.Unlock()
+
+	if !exists {
+		return nil
+	}
+
+	// Drain queue without blocking
+	var messages []shared.Message
+	for {
+		select {
+		case msg := <-client.Queue:
+			messages = append(messages, msg)
+		default:
+			reply.Messages = messages
+			return nil
+		}
+	}
+}
+
+func (s *ChatServer) ListUsers(args *shared.ListUsersArgs, reply *shared.ListUsersReply) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	users := make([]string, 0, len(s.clients))
+	for username := range s.clients {
+		users = append(users, username)
+	}
+	reply.Users = users
+	return nil
+}
+
+// Internal thread-unsafe broadcast helper (must hold s.mu Lock)
+func (s *ChatServer) broadcastUnsafe(msg shared.Message, excludeUser string) {
+	for username, client := range s.clients {
+		if username == excludeUser {
+			continue
+		}
+		select {
+		case client.Queue <- msg:
+		default:
+			// Queue full; discard oldest message to avoid blocking server operations
+			select {
+			case <-client.Queue:
+			default:
+			}
+			client.Queue <- msg
+		}
+	}
+}
+
+func (s *ChatServer) removeClient(username string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.clients[username]; exists {
+		delete(s.clients, username)
+		log.Printf("User '%s' disconnected.", username)
+
+		s.broadcastUnsafe(shared.Message{
+			Sender:    "SERVER",
+			Content:   fmt.Sprintf("User '%s' has left the chat.", username),
+			Type:      shared.TypeNotification,
+			Timestamp: time.Now(),
+		}, username)
+	}
+}
+
+func (s *ChatServer) cleanupStaleClients(timeout time.Duration) {
+	ticker := time.NewTicker(10 * time.Second)
+	for range ticker.C {
+		s.mu.Lock()
+		now := time.Now()
+		for username, client := range s.clients {
+			if now.Sub(client.LastActive) > timeout {
+				log.Printf("Client '%s' timed out due to inactivity.", username)
+				delete(s.clients, username)
+				s.broadcastUnsafe(shared.Message{
+					Sender:    "SERVER",
+					Content:   fmt.Sprintf("User '%s' timed out.", username),
+					Type:      shared.TypeNotification,
+					Timestamp: time.Now(),
+				}, username)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 func main() {
-	reader := bufio.NewReader(os.Stdin)
-
-	fmt.Print("Enter server address (e.g., localhost:12345 or press Enter for default): ")
-	addr, _ := reader.ReadString('\n')
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
-		addr = "localhost:12345"
-	}
-
-	rpcClient, err := rpc.Dial("tcp", addr)
+	server := NewChatServer()
+	err := rpc.Register(server)
 	if err != nil {
-		log.Fatalf("Failed to connect to RPC server at %s: %v", addr, err)
-	}
-	defer rpcClient.Close()
-
-	app := &ClientApp{
-		rpcClient: rpcClient,
-		stopChan:  make(chan struct{}),
+		log.Fatalf("RPC Register Error: %v", err)
 	}
 
-	// User Join Authentication Loop
-	for {
-		fmt.Print("Enter unique username: ")
-		username, _ := reader.ReadString('\n')
-		username = strings.TrimSpace(username)
-
-		if username == "" {
-			fmt.Println("Username cannot be empty.")
-			continue
-		}
-
-		var reply shared.JoinReply
-		err := rpcClient.Call("ChatServer.Join", &shared.JoinArgs{Username: username}, &reply)
-		if err != nil {
-			log.Fatalf("RPC Join Error: %v", err)
-		}
-
-		if reply.Success {
-			app.username = username
-			fmt.Println("\n" + reply.Message)
-			break
-		} else {
-			fmt.Printf("Error: %s\n", reply.Message)
-		}
+	listener, err := net.Listen("tcp", ":12345")
+	if err != nil {
+		log.Fatalf("Listen error: %v", err)
 	}
+	defer listener.Close()
 
-	// Handle Ctrl+C for clean leave
+	log.Println("RPC Chat Server listening on port 12345...")
+
+	// Graceful Shutdown on Ctrl+C
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		app.disconnect()
+		log.Println("\nServer shutting down...")
+		listener.Close()
 		os.Exit(0)
 	}()
 
-	// Start continuous background polling goroutine
-	go app.pollMessages()
-
-	printHelp()
-
-	// Terminal input processing loop
 	for {
-		fmt.Print("> ")
-		input, err := reader.ReadString('\n')
+		conn, err := listener.Accept()
 		if err != nil {
-			app.disconnect()
-			break
-		}
-
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
-		}
-
-		switch {
-		case input == "/help":
-			printHelp()
-
-		case input == "/users":
-			var reply shared.ListUsersReply
-			err := app.rpcClient.Call("ChatServer.ListUsers", &shared.ListUsersArgs{}, &reply)
-			if err != nil {
-				fmt.Printf("[Error fetching users: %v]\n", err)
-			} else {
-				fmt.Printf("\n--- Connected Users (%d) ---\n", len(reply.Users))
-				for _, user := range reply.Users {
-					fmt.Printf("- %s\n", user)
-				}
-				fmt.Println("---------------------------")
-			}
-
-		case input == "/exit":
-			app.disconnect()
-			fmt.Println("Disconnected from chat.")
-			return
-
-		default:
-			// Send standard chat message
-			var reply shared.SendMessageReply
-			err := app.rpcClient.Call("ChatServer.SendMessage", &shared.SendMessageArgs{
-				Sender:  app.username,
-				Content: input,
-			}, &reply)
-
-			if err != nil {
-				fmt.Printf("[Error sending message: %v]\n", err)
-			} else if !reply.Success {
-				fmt.Printf("[Server Error: %s]\n", reply.Message)
-			}
-		}
-	}
-}
-
-func (app *ClientApp) pollMessages() {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-app.stopChan:
-			return
-		case <-ticker.C:
-			var reply shared.FetchMessagesReply
-			err := app.rpcClient.Call("ChatServer.FetchMessages", &shared.FetchMessagesArgs{Username: app.username}, &reply)
-			if err != nil {
-				// Server unreachable or connection closed
+			select {
+			case <-sigChan:
 				return
-			}
-
-			for _, msg := range reply.Messages {
-				timestamp := msg.Timestamp.Format("15:04:05")
-				if msg.Type == shared.TypeNotification {
-					fmt.Printf("\r\033[K[%s] *** %s ***\n> ", timestamp, msg.Content)
-				} else {
-					fmt.Printf("\r\033[K[%s] <%s>: %s\n> ", timestamp, msg.Sender, msg.Content)
-				}
+			default:
+				log.Printf("Accept error: %v", err)
+				continue
 			}
 		}
+		go rpc.ServeConn(conn)
 	}
-}
-
-func (app *ClientApp) disconnect() {
-	close(app.stopChan)
-	var reply shared.LeaveReply
-	_ = app.rpcClient.Call("ChatServer.Leave", &shared.LeaveArgs{Username: app.username}, &reply)
-}
-
-func printHelp() {
-	fmt.Println("\n================ Command Help ================")
-	fmt.Println(" Type any text and press Enter to broadcast.")
-	fmt.Println(" /users - List all currently online users")
-	fmt.Println(" /help  - Display available commands")
-	fmt.Println(" /exit  - Gracefully leave the chat")
-	fmt.Println("==============================================\n")
 }
