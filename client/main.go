@@ -41,7 +41,6 @@ func main() {
 		stopChan:  make(chan struct{}),
 	}
 
-	// User Join Authentication Loop
 	for {
 		fmt.Print("Enter unique username: ")
 		username, _ := reader.ReadString('\n')
@@ -67,7 +66,6 @@ func main() {
 		}
 	}
 
-	// Handle Ctrl+C for clean leave
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -76,12 +74,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start continuous background polling goroutine
 	go app.pollMessages()
 
 	printHelp()
 
-	// Terminal input processing loop
 	for {
 		fmt.Print("> ")
 		input, err := reader.ReadString('\n')
@@ -118,7 +114,6 @@ func main() {
 			return
 
 		default:
-			// Send standard chat message
 			var reply shared.SendMessageReply
 			err := app.rpcClient.Call("ChatServer.SendMessage", &shared.SendMessageArgs{
 				Sender:  app.username,
@@ -146,7 +141,6 @@ func (app *ClientApp) pollMessages() {
 			var reply shared.FetchMessagesReply
 			err := app.rpcClient.Call("ChatServer.FetchMessages", &shared.FetchMessagesArgs{Username: app.username}, &reply)
 			if err != nil {
-				// Server unreachable or connection closed
 				return
 			}
 
